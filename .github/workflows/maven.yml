@@ -15,7 +15,13 @@
 
 name: Java CI
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Surefire -Dtest selector; empty runs the full suite'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -24,14 +30,11 @@ jobs:
   build:
 
     runs-on: ubuntu-latest
-    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 45
     strategy:
+      fail-fast: false
       matrix:
-        java: [ 8, 11, 17, 21, 23 ]
-        experimental: [false]
-        include:
-          - java: 24-ea
-            experimental: true
+        java: [ 8, 11, 17, 21, 23, 24 ]
         
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # 4.2.2
@@ -49,4 +52,87 @@ jobs:
         distribution: 'temurin'
         java-version: ${{ matrix.java }}
     - name: Build with Maven
-      run: mvn --errors --show-version --batch-mode --no-transfer-progress
+      env:
+        # Base64Test.testCodec265 assumes >5.33 GiB free heap; the default max heap (1/4 of the runner's RAM) skips it
+        _JAVA_OPTIONS: -Xmx10g
+      run: |
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          mvn --errors --show-version --batch-mode --no-transfer-progress clean verify -Djacoco.skip=true -Dsurefire.failIfNoSpecifiedTests=false -Dtest=${{ inputs.test-filter }}
+        else
+          mvn --errors --show-version --batch-mode --no-transfer-progress
+        fi
+    - name: List skipped tests with reasons
+      if: always()
+      run: |
+        java -version 2>&1 | head -1
+        mkdir -p /tmp/probe && cat > /tmp/probe/Probe.java <<'JAVA'
+        public class Probe {
+            public static void main(String[] a) {
+                String[] algs = org.apache.commons.codec.digest.MessageDigestAlgorithms.values();
+                for (int i = 0; i < algs.length; i++) {
+                    System.out.println("PROBE " + (i + 1) + " " + algs[i] + " " + org.apache.commons.codec.digest.DigestUtils.isAvailable(algs[i]));
+                }
+            }
+        }
+        JAVA
+        if [ -d target/classes ]; then
+          javac -cp target/classes -d /tmp/probe /tmp/probe/Probe.java
+          java -cp target/classes:/tmp/probe Probe | tee /tmp/probe/out.txt
+        fi
+        python3 - <<'PY'
+        import glob, re, xml.etree.ElementTree as ET
+        algs = {}
+        try:
+            for line in open('/tmp/probe/out.txt'):
+                _, idx, name, ok = line.split()
+                algs[idx] = (name, ok == 'true')
+        except OSError:
+            pass
+        def source_reason(cls, name):
+            path = 'src/test/java/' + cls.replace('.', '/') + '.java'
+            try:
+                src = open(path).read()
+            except OSError:
+                return None
+            meth = name.split('(')[0]
+            m = re.search(r'void ' + re.escape(meth) + r'\(.*?\n    }', src, re.S)
+            if not m:
+                return None
+            calls = re.findall(r'(assume\w*\([^;]*\));', m.group(0))
+            out = []
+            for c in calls:
+                helper = re.match(r'(assume\w+)\(\)', c)
+                if helper:
+                    hm = re.search(r'void ' + helper.group(1) + r'\(\) \{(.*?)\}', src, re.S)
+                    out.append(c + (' => ' + hm.group(1).strip() if hm else ''))
+                else:
+                    out.append(c)
+            return '; '.join(out) if out else None
+        n = 0
+        for f in sorted(glob.glob('target/surefire-reports/TEST-*.xml')):
+            for tc in ET.parse(f).getroot().iter('testcase'):
+                sk = tc.find('skipped')
+                if sk is None:
+                    continue
+                n += 1
+                cls, name = tc.get('classname'), tc.get('name')
+                msg = (sk.get('message') or (sk.text or '').strip() or 'no message').strip().splitlines()[0]
+                if 'assumption is not true' in msg:
+                    why = source_reason(cls, name)
+                    idx = re.search(r'\[(\d+)\]$', name)
+                    if idx and idx.group(1) in algs and not algs[idx.group(1)][1]:
+                        msg += ' -- cause: data()[%s] is MessageDigest algorithm %s, which this JDK does not provide (DigestUtils.isAvailable == false; SHA3 digests arrived in Java 9)' % (idx.group(1), algs[idx.group(1)][0])
+                    elif why:
+                        msg += ' -- cause: unmet source assumption ' + why + ' on this JDK'
+                print('SKIPPED %s.%s: %s' % (cls, name, msg))
+        print('Total skipped tests listed: %d' % n)
+        PY
+    - name: Upload release jars
+      if: matrix.java == 21
+      uses: actions/upload-artifact@v4
+      with:
+        name: commons-codec-jars
+        path: |
+          target/commons-codec-1.18.0.jar
+          target/commons-codec-1.18.0-tests.jar
+        if-no-files-found: error
